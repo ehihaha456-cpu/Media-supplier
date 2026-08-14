@@ -264,13 +264,11 @@ async def on_post_init(application):
     await db.init_db()
     await reschedule_job(application)
 
-def main():
+
+def build_application():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is required")
     app = Application.builder().token(BOT_TOKEN).post_init(on_post_init).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("admin", admin))
 
     conv = ConversationHandler(
         entry_points=[
@@ -286,6 +284,8 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
     )
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("admin", admin))
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(settings_page, pattern="^settings$"))
     app.add_handler(CallbackQueryHandler(editor_page, pattern="^editor$"))
@@ -294,11 +294,19 @@ def main():
     app.add_handler(CallbackQueryHandler(preview, pattern="^preview$"))
     app.add_handler(CallbackQueryHandler(library, pattern="^library$"))
     app.add_handler(CallbackQueryHandler(status, pattern="^status$"))
-    app.add_handler(CallbackQueryHandler(lambda u, c: u.callback_query.edit_message_text("⚙️ Admin Panel", reply_markup=main_keyboard(owner(u.callback_query.from_user.id))), pattern="^home$"))
-
+    app.add_handler(CallbackQueryHandler(
+        lambda u, c: u.callback_query.edit_message_text(
+            "⚙️ Admin Panel",
+            reply_markup=main_keyboard(owner(u.callback_query.from_user.id))
+        ),
+        pattern="^home$"
+    ))
     app.add_handler(ChatMemberHandler(chat_membership, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, source_media))
+    return app
 
+def main():
+    app = build_application()
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
