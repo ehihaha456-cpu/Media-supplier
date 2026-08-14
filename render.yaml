@@ -1,0 +1,19 @@
+services:
+  - type: worker
+    name: auto-media-delivery-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m app.bot
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: MONGO_URI
+        sync: false
+      - key: MONGO_DB
+        value: auto_media_bot
+      - key: OWNER_IDS
+        sync: false
+      - key: DEFAULT_STORAGE_LIMIT
+        value: "20"
+      - key: DEFAULT_INTERVAL_MINUTES
+        value: "60"
