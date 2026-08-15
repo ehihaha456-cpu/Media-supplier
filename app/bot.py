@@ -34,61 +34,70 @@ def protected_markup(settings):
 
 
 async def send_media(bot, chat_id, media, settings):
-    kwargs = {
-        "caption": settings.get("caption", "")[:1024],
-        "reply_markup": protected_markup(settings),
-        "protect_content": bool(settings.get("protect_content", True)),
-    }
-    if media["kind"] == "video":
-        return await bot.send_video(chat_id, media["file_id"], **kwargs)
-    if media["kind"] == "photo":
-        return await bot.send_photo(chat_id, media["file_id"], **kwargs)
-    if media["kind"] == "document":
-        return await bot.send_document(chat_id, media["file_id"], **kwargs)
+    caption = settings.get("caption") or ""
+    raw_buttons = settings.get("buttons") or []
 
+    # Support both:
+    # old format: [{"text": "...", "url": "..."}]
+    # new format: [[{"text": "...", "url": "..."}, {"text": "...", "url": "..."}], ...]
+    if raw_buttons and isinstance(raw_buttons[0], dict):
+        button_rows = [raw_buttons]
+    else:
+        button_rows = raw_buttons
+
+    keyboard = []
+    for row in button_rows:
+        if not isinstance(row, list):
+            continue
+        out_row = []
+        for button in row:
+            if not isinstance(button, dict):
+                continue
+            text = button.get("text")
+            url = button.get("url")
+            if text and url:
+                out_row.append(InlineKeyboardButton(text=text, url=url))
+        if out_row:
+            keyboard.append(out_row)
+
+    markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+    kwargs = {
+        "caption": caption[:1024],
+        "reply_markup": markup,
+        "protect_content": bool(settings.get("protect_content", False)),
+    }
+
+    kind = media.get("kind")
+    file_id = media.get("file_id")
+    if not file_id:
+        raise ValueError("Media file_id is missing")
+
+    if kind == "video":
+        await bot.send_video(chat_id=chat_id, video=file_id, **kwargs)
+    elif kind == "photo":
+        await bot.send_photo(chat_id=chat_id, photo=file_id, **kwargs)
+    elif kind == "document":
+        await bot.send_document(chat_id=chat_id, document=file_id, **kwargs)
+    else:
+        raise ValueError(f"Unsupported media kind: {kind}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Activate a user and immediately deliver the oldest retained media."""
     if not update.effective_user or not update.effective_message:
         return
-
-    user_id = update.effective_user.id
-    await db.activate_user(user_id)
-    settings = await db.get_settings()
-
+    await db.activate_user(update.effective_user.id)
+    s = await db.get_settings()
     await update.effective_message.reply_text(
         "👋 Welcome!\n\nYour automatic media delivery is active.",
-        reply_markup=main_keyboard(settings) if is_owner(user_id) else None,
+        reply_markup=main_keyboard(s) if is_owner(update.effective_user.id) else None,
     )
 
-    if not bool(settings.get("delivery_enabled", True)):
-        await update.effective_message.reply_text(
-            "⏸ Auto delivery is currently disabled by the admin."
-        )
-        return
-
-    media = await db.oldest_media()
-    if not media:
-        await update.effective_message.reply_text(
-            "ℹ️ No media is available yet.\n\n"
-            "Make sure the source group is configured and send a new media there."
-        )
-        log.warning("User %s started but media library is empty.", user_id)
-        return
-
-    try:
-        await send_media(context.bot, user_id, media, settings)
-        next_seq = media["seq"] + 1
-        next_due = db.now() + timedelta(
-            minutes=max(1, int(settings.get("interval_minutes", 60)))
-        )
-        await db.update_user_cursor(user_id, next_seq, next_due)
-        log.info("Initial media seq=%s sent to user %s", media["seq"], user_id)
-    except Exception:
-        log.exception("Initial media delivery failed for user %s", user_id)
-        await update.effective_message.reply_text(
-            "❌ Media could not be sent. Check the Render logs for the exact Telegram error."
-        )
+    oldest = await db.oldest_media()
+    if oldest:
+        try:
+            await send_media(context.bot, update.effective_user.id, oldest, s)
+            await db.update_user_cursor(update.effective_user.id, oldest["seq"] + 1, db.now() + timedelta(minutes=int(s.get("interval_minutes", 60))))
+        except Exception:
+            log.exception("Initial media delivery failed")
 
 
 async def stop(update, context):
@@ -523,11 +532,11 @@ async def source_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if seq:
             log.info("Captured photo seq=%s from source %s", seq, chat.id)
     elif msg.document:
-        seq = await db.save_media("document", msg.document.file_id)
-        if seq:
-            log.info("Captured document seq=%s from source %s", seq, chat.id)
-    else:
-        log.info("Source chat %s message %s has no supported media.", chat.id, msg.message_id)
+        mime = msg.document.mime_type or ""
+        if mime.startswith("video/") or mime.startswith("image/"):
+            seq = await db.save_media("document", msg.document.file_id)
+            if seq:
+                log.info("Captured document seq=%s from source %s", seq, chat.id)
 
 
 async def deliver_one(bot, target_id, cursor, settings):
@@ -613,8 +622,8 @@ async def delivery_loop(application):
                             chat.get("next_seq"),
                             at + timedelta(minutes=interval),
                         )
-                except Exception:
-                    log.exception("Chat %s delivery failed", chat.get("chat_id"))
+                except Exception as exc:
+                    log.exception("Chat %s delivery failed: %s", chat.get("chat_id"), exc)
                     await db.update_chat_cursor(
                         chat["chat_id"],
                         chat.get("next_seq"),
