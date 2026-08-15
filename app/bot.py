@@ -91,7 +91,9 @@ async def admin(update, context):
     await update.effective_message.reply_text("🛠 Admin Panel", reply_markup=main_keyboard(s))
 
 
-async def toggle_delivery(q, context):
+async def toggle_delivery(update, context):
+    q = update.callback_query
+    await q.answer()
     s = await db.get_settings()
     new = not bool(s.get("delivery_enabled", True))
     await db.set_delivery_enabled(new)
@@ -100,7 +102,9 @@ async def toggle_delivery(q, context):
     await q.edit_message_text("🛠 Admin Panel", reply_markup=main_keyboard(s))
 
 
-async def test_send(q, context):
+async def test_send(update, context):
+    q = update.callback_query
+    await q.answer()
     media = await db.latest_media()
     if not media:
         await q.answer("No media available", show_alert=True)
@@ -114,12 +118,16 @@ async def test_send(q, context):
         log.exception("Test send failed: %s", e)
 
 
-async def settings_page(q, context):
+async def settings_page(update, context):
+    q = update.callback_query
+    await q.answer()
     s = await db.get_settings()
     await q.edit_message_text("⚙️ Settings", reply_markup=settings_keyboard(s))
 
 
-async def editor_page(q, context):
+async def editor_page(update, context):
+    q = update.callback_query
+    await q.answer()
     s = await db.get_settings()
     caption = s.get("caption") or "(empty)"
     buttons = s.get("buttons", [])
@@ -127,25 +135,33 @@ async def editor_page(q, context):
     await q.edit_message_text(text, reply_markup=editor_keyboard())
 
 
-async def home(q, context):
+async def home(update, context):
+    q = update.callback_query
+    await q.answer()
     s = await db.get_settings()
     await q.edit_message_text("🛠 Admin Panel", reply_markup=main_keyboard(s))
 
 
-async def toggle_protect(q, context):
+async def toggle_protect(update, context):
+    q = update.callback_query
+    await q.answer()
     s = await db.get_settings()
     await db.update_settings({"protect_content": not bool(s.get("protect_content", True))})
     await q.answer("Protection updated")
     await settings_page(q, context)
 
 
-async def clear_caption(q, context):
+async def clear_caption(update, context):
+    q = update.callback_query
+    await q.answer()
     await db.update_settings({"caption": ""})
     await q.answer("Caption cleared")
     await editor_page(q, context)
 
 
-async def clear_buttons(q, context):
+async def clear_buttons(update, context):
+    q = update.callback_query
+    await q.answer()
     await db.update_settings({"buttons": []})
     await q.answer("Buttons cleared")
     await editor_page(q, context)
@@ -226,24 +242,63 @@ async def save_text(update, context):
 async def save_button(update, context):
     if not is_owner(update.effective_user.id):
         return ConversationHandler.END
-    text = (update.effective_message.text or "").strip()
-    if "|" not in text:
-        await update.effective_message.reply_text("❌ Format: Button Text | https://example.com")
-        return WAIT_BUTTON
-    label, url = [x.strip() for x in text.split("|", 1)]
-    if not label or len(label) > 64 or not url.startswith(("https://", "http://", "tg://")):
-        await update.effective_message.reply_text("❌ Invalid button text or URL.")
-        return WAIT_BUTTON
-    s = await db.get_settings()
-    buttons = list(s.get("buttons", []))
-    if len(buttons) >= 20:
-        await update.effective_message.reply_text("❌ Maximum 20 buttons reached.")
-        return ConversationHandler.END
-    buttons.append({"text": label, "url": url})
-    await db.update_settings({"buttons": buttons})
-    await update.effective_message.reply_text("✅ Button added.", reply_markup=main_keyboard())
-    return ConversationHandler.END
 
+    raw = (update.effective_message.text or "").strip()
+    if not raw:
+        await update.effective_message.reply_text("❌ Button input is empty.")
+        return WAIT_BUTTON
+
+    rows = []
+    total = 0
+
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        row = []
+        for item in line.split("||"):
+            item = item.strip()
+            if "|" not in item:
+                await update.effective_message.reply_text(
+                    "❌ Format error.\n\n"
+                    "Use:\n"
+                    "Button Text | https://example.com\n\n"
+                    "Same row:\n"
+                    "Button 1 | URL1 || Button 2 | URL2"
+                )
+                return WAIT_BUTTON
+            label, url = [x.strip() for x in item.split("|", 1)]
+            if (
+                not label
+                or len(label) > 64
+                or not url.startswith(("https://", "http://", "tg://"))
+            ):
+                await update.effective_message.reply_text(
+                    f"❌ Invalid button:\n{label or '(empty)'}"
+                )
+                return WAIT_BUTTON
+            row.append({"text": label, "url": url})
+            total += 1
+            if total > 20:
+                await update.effective_message.reply_text(
+                    "❌ Maximum 20 buttons allowed."
+                )
+                return WAIT_BUTTON
+        rows.append(row)
+
+    if not rows:
+        await update.effective_message.reply_text("❌ No buttons found.")
+        return WAIT_BUTTON
+
+    s = await db.get_settings()
+    await db.update_settings({"buttons": rows})
+
+    await update.effective_message.reply_text(
+        f"✅ {total} button(s) saved.\n"
+        f"Rows: {len(rows)}\n\n"
+        "You can open Editor → Preview to check them."
+    )
+    return ConversationHandler.END
 
 async def cancel(update, context):
     context.user_data.pop("editor_action", None)
@@ -251,7 +306,9 @@ async def cancel(update, context):
     return ConversationHandler.END
 
 
-async def manage_buttons(q, context):
+async def manage_buttons(update, context):
+    q = update.callback_query
+    await q.answer()
     s = await db.get_settings()
     buttons = s.get("buttons", [])
     if not buttons:
@@ -261,7 +318,9 @@ async def manage_buttons(q, context):
     await q.edit_message_text("🗑 Tap a button to remove it:", reply_markup=button_manage_keyboard(buttons))
 
 
-async def delete_button(q, context):
+async def delete_button(update, context):
+    q = update.callback_query
+    await q.answer()
     try:
         idx = int(q.data.split(":", 1)[1])
     except Exception:
@@ -276,7 +335,9 @@ async def delete_button(q, context):
     await manage_buttons(q, context)
 
 
-async def preview(q, context):
+async def preview(update, context):
+    q = update.callback_query
+    await q.answer()
     media = await db.latest_media()
     if not media:
         await q.answer("No media available yet", show_alert=True)
@@ -286,7 +347,9 @@ async def preview(q, context):
     await send_media(context.bot, q.message.chat_id, media, s)
 
 
-async def library(q, context):
+async def library(update, context):
+    q = update.callback_query
+    await q.answer()
     count = await db.media_count()
     oldest = await db.oldest_media()
     latest = await db.latest_media()
@@ -299,7 +362,9 @@ async def library(q, context):
     await q.edit_message_text(text, reply_markup=main_keyboard())
 
 
-async def status(q, context):
+async def status(update, context):
+    q = update.callback_query
+    await q.answer()
     s = await db.get_settings()
     users = await db.db.users.count_documents({"active": True})
     chats = await db.db.chats.count_documents({"active": True, "delivery_enabled": True})
@@ -317,13 +382,17 @@ async def status(q, context):
     await q.edit_message_text(text, reply_markup=main_keyboard())
 
 
-async def users_page(q, context):
+async def users_page(update, context):
+    q = update.callback_query
+    await q.answer()
     total = await db.db.users.count_documents({})
     active = await db.db.users.count_documents({"active": True})
     await q.edit_message_text(f"👥 Users\n\nTotal users: {total}\nActive delivery: {active}", reply_markup=main_keyboard())
 
 
-async def chats_page(q, context):
+async def chats_page(update, context):
+    q = update.callback_query
+    await q.answer()
     chats = await db.list_chats()
     if not chats:
         await q.edit_message_text("💬 No groups/channels found yet. Add the bot to a group/channel first.", reply_markup=main_keyboard())
@@ -331,7 +400,9 @@ async def chats_page(q, context):
     await q.edit_message_text("💬 Groups & Channels\n\nTap a chat to turn automatic delivery ON/OFF.", reply_markup=chat_keyboard(chats))
 
 
-async def toggle_chat(q, context):
+async def toggle_chat(update, context):
+    q = update.callback_query
+    await q.answer()
     chat_id = int(q.data.split(":", 1)[1])
     chat = await db.db.chats.find_one({"chat_id": chat_id})
     if not chat:
@@ -343,25 +414,33 @@ async def toggle_chat(q, context):
     await chats_page(q, context)
 
 
-async def source_menu(q, context):
+async def source_menu(update, context):
+    q = update.callback_query
+    await q.answer()
     chats = await db.list_chats()
     await q.edit_message_text("🎯 Select the source group/channel. Media posted there will be captured automatically.", reply_markup=source_keyboard(chats))
 
 
-async def set_source(q, context):
+async def set_source(update, context):
+    q = update.callback_query
+    await q.answer()
     chat_id = int(q.data.split(":", 1)[1])
     await db.set_source_chat(chat_id)
     await q.answer("Source saved")
     await settings_page(q, context)
 
 
-async def clear_source(q, context):
+async def clear_source(update, context):
+    q = update.callback_query
+    await q.answer()
     await db.clear_source_chat()
     await q.answer("Source cleared")
     await settings_page(q, context)
 
 
-async def source_help(q, context):
+async def source_help(update, context):
+    q = update.callback_query
+    await q.answer()
     await q.answer()
     await q.edit_message_text("Add the bot to your source group, make sure it can see messages, then send /setsource in that group as the owner.\n\nThe bot will capture new videos/photos/documents from that group automatically.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="source_menu")]]))
 
