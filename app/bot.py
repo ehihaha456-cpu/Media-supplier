@@ -43,20 +43,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not update.effective_message:
         return
     await db.activate_user(update.effective_user.id)
+    s = await db.get_settings()
     await update.effective_message.reply_text(
-        "👋 Welcome!\n\nThe media delivery system is active. New media will be delivered automatically according to the configured timing.",
-        reply_markup=main_keyboard() if is_owner(update.effective_user.id) else None,
+        "👋 Welcome!\n\nYour automatic media delivery is active.",
+        reply_markup=main_keyboard(s) if is_owner(update.effective_user.id) else None,
     )
 
-    # Deliver the first available media immediately so the user knows the bot works.
-    s = await db.get_settings()
     oldest = await db.oldest_media()
     if oldest:
         try:
             await send_media(context.bot, update.effective_user.id, oldest, s)
             await db.update_user_cursor(update.effective_user.id, oldest["seq"] + 1, db.now() + timedelta(minutes=int(s.get("interval_minutes", 60))))
-        except Exception as e:
-            log.warning("Initial media delivery failed: %s", e)
+        except Exception:
+            log.exception("Initial media delivery failed")
 
 
 async def stop(update, context):
@@ -88,7 +87,31 @@ async def diag(update, context):
 async def admin(update, context):
     if not is_owner(update.effective_user.id):
         return
-    await update.effective_message.reply_text("🛠 Admin Panel", reply_markup=main_keyboard())
+    s = await db.get_settings()
+    await update.effective_message.reply_text("🛠 Admin Panel", reply_markup=main_keyboard(s))
+
+
+async def toggle_delivery(q, context):
+    s = await db.get_settings()
+    new = not bool(s.get("delivery_enabled", True))
+    await db.set_delivery_enabled(new)
+    await q.answer("Auto delivery " + ("ON" if new else "OFF"))
+    s = await db.get_settings()
+    await q.edit_message_text("🛠 Admin Panel", reply_markup=main_keyboard(s))
+
+
+async def test_send(q, context):
+    media = await db.latest_media()
+    if not media:
+        await q.answer("No media available", show_alert=True)
+        return
+    s = await db.get_settings()
+    try:
+        await send_media(context.bot, q.from_user.id, media, s)
+        await q.answer("Test media sent")
+    except Exception as e:
+        await q.answer("Send failed", show_alert=True)
+        log.exception("Test send failed: %s", e)
 
 
 async def settings_page(q, context):
@@ -105,7 +128,8 @@ async def editor_page(q, context):
 
 
 async def home(q, context):
-    await q.edit_message_text("🛠 Admin Panel", reply_markup=main_keyboard())
+    s = await db.get_settings()
+    await q.edit_message_text("🛠 Admin Panel", reply_markup=main_keyboard(s))
 
 
 async def toggle_protect(q, context):
@@ -402,6 +426,9 @@ async def delivery_loop(application):
     while True:
         try:
             settings = await db.get_settings()
+            if not bool(settings.get("delivery_enabled", True)):
+                await asyncio.sleep(10)
+                continue
             interval = max(1, int(settings.get("interval_minutes", 60)))
             at = db.now()
 
@@ -459,6 +486,8 @@ def build_application():
         allow_reentry=True,
     )
     app.add_handler(conv)
+    app.add_handler(CallbackQueryHandler(toggle_delivery, pattern="^toggle_delivery$"))
+    app.add_handler(CallbackQueryHandler(test_send, pattern="^test_send$"))
     app.add_handler(CallbackQueryHandler(settings_page, pattern="^settings$"))
     app.add_handler(CallbackQueryHandler(editor_page, pattern="^editor$"))
     app.add_handler(CallbackQueryHandler(toggle_protect, pattern="^toggle_protect$"))

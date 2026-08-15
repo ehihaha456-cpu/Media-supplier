@@ -27,6 +27,7 @@ async def init_db():
             "caption": "",
             "buttons": [],
             "source_chat_id": None,
+            "delivery_enabled": True,
             "updated_at": now(),
         }},
         upsert=True,
@@ -168,3 +169,11 @@ async def get_source_chat_id():
 
 async def clear_source_chat():
     await update_settings({"source_chat_id": None})
+
+
+async def set_delivery_enabled(enabled: bool):
+    await update_settings({"delivery_enabled": bool(enabled)})
+
+async def get_delivery_enabled():
+    s = await get_settings()
+    return bool(s.get("delivery_enabled", True)) if s else True

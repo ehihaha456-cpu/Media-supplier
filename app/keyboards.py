@@ -1,11 +1,15 @@
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 
-def main_keyboard():
+def main_keyboard(settings=None):
+    enabled = True if not settings else bool(settings.get("delivery_enabled", True))
+    state = "ON" if enabled else "OFF"
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🚀 Auto Delivery: {state}", callback_data="toggle_delivery")],
         [InlineKeyboardButton("⚙️ Settings", callback_data="settings"), InlineKeyboardButton("✏️ Editor", callback_data="editor")],
         [InlineKeyboardButton("👥 Users", callback_data="users"), InlineKeyboardButton("💬 Groups & Channels", callback_data="chats")],
         [InlineKeyboardButton("📦 Media Library", callback_data="library"), InlineKeyboardButton("📊 Status", callback_data="status")],
+        [InlineKeyboardButton("🧪 Send Test", callback_data="test_send")],
     ])
 
 
