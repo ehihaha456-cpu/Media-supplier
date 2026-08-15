@@ -48,22 +48,47 @@ async def send_media(bot, chat_id, media, settings):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Activate a user and immediately deliver the oldest retained media."""
     if not update.effective_user or not update.effective_message:
         return
-    await db.activate_user(update.effective_user.id)
-    s = await db.get_settings()
+
+    user_id = update.effective_user.id
+    await db.activate_user(user_id)
+    settings = await db.get_settings()
+
     await update.effective_message.reply_text(
         "👋 Welcome!\n\nYour automatic media delivery is active.",
-        reply_markup=main_keyboard(s) if is_owner(update.effective_user.id) else None,
+        reply_markup=main_keyboard(settings) if is_owner(user_id) else None,
     )
 
-    oldest = await db.oldest_media()
-    if oldest:
-        try:
-            await send_media(context.bot, update.effective_user.id, oldest, s)
-            await db.update_user_cursor(update.effective_user.id, oldest["seq"] + 1, db.now() + timedelta(minutes=int(s.get("interval_minutes", 60))))
-        except Exception:
-            log.exception("Initial media delivery failed")
+    if not bool(settings.get("delivery_enabled", True)):
+        await update.effective_message.reply_text(
+            "⏸ Auto delivery is currently disabled by the admin."
+        )
+        return
+
+    media = await db.oldest_media()
+    if not media:
+        await update.effective_message.reply_text(
+            "ℹ️ No media is available yet.\n\n"
+            "Make sure the source group is configured and send a new media there."
+        )
+        log.warning("User %s started but media library is empty.", user_id)
+        return
+
+    try:
+        await send_media(context.bot, user_id, media, settings)
+        next_seq = media["seq"] + 1
+        next_due = db.now() + timedelta(
+            minutes=max(1, int(settings.get("interval_minutes", 60)))
+        )
+        await db.update_user_cursor(user_id, next_seq, next_due)
+        log.info("Initial media seq=%s sent to user %s", media["seq"], user_id)
+    except Exception:
+        log.exception("Initial media delivery failed for user %s", user_id)
+        await update.effective_message.reply_text(
+            "❌ Media could not be sent. Check the Render logs for the exact Telegram error."
+        )
 
 
 async def stop(update, context):
@@ -498,11 +523,11 @@ async def source_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if seq:
             log.info("Captured photo seq=%s from source %s", seq, chat.id)
     elif msg.document:
-        mime = msg.document.mime_type or ""
-        if mime.startswith("video/") or mime.startswith("image/"):
-            seq = await db.save_media("document", msg.document.file_id)
-            if seq:
-                log.info("Captured document seq=%s from source %s", seq, chat.id)
+        seq = await db.save_media("document", msg.document.file_id)
+        if seq:
+            log.info("Captured document seq=%s from source %s", seq, chat.id)
+    else:
+        log.info("Source chat %s message %s has no supported media.", chat.id, msg.message_id)
 
 
 async def deliver_one(bot, target_id, cursor, settings):
