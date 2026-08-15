@@ -65,6 +65,26 @@ async def stop(update, context):
         await update.effective_message.reply_text("⏹ Automatic media delivery stopped. Use /start to enable it again.")
 
 
+
+async def diag(update, context):
+    if not is_owner(update.effective_user.id):
+        return
+    try:
+        s = await db.get_settings()
+        media = await db.media_count()
+        source = s.get("source_chat_id") if s else None
+        await update.effective_message.reply_text(
+            "🔧 Diagnostics\n\n"
+            f"MongoDB: connected\n"
+            f"Stored media: {media}\n"
+            f"Source chat: {source or 'Not set'}\n"
+            f"Interval: {s.get('interval_minutes') if s else '-'} min\n"
+            f"Protection: {'ON' if s and s.get('protect_content') else 'OFF'}"
+        )
+    except Exception as e:
+        log.exception("Diagnostics failed")
+        await update.effective_message.reply_text(f"❌ Diagnostics error: {e}")
+
 async def admin(update, context):
     if not is_owner(update.effective_user.id):
         return
@@ -353,8 +373,10 @@ async def source_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if msg.video:
         await db.save_media("video", msg.video.file_id)
+        log.info("Captured video from source chat %s", update.effective_chat.id)
     elif msg.photo:
         await db.save_media("photo", msg.photo[-1].file_id)
+        log.info("Captured photo from source chat %s", update.effective_chat.id)
     elif msg.document:
         # Store only document media; text files etc. are ignored.
         if msg.document.mime_type and (msg.document.mime_type.startswith("video/") or msg.document.mime_type.startswith("image/")):
@@ -419,6 +441,7 @@ def build_application():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stop", stop))
     app.add_handler(CommandHandler("admin", admin))
+    app.add_handler(CommandHandler("diag", diag))
     app.add_handler(CommandHandler("setsource", setsource))
 
     conv = ConversationHandler(
