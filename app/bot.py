@@ -18,56 +18,11 @@ def is_owner(uid):
     return uid in OWNER_IDS
 
 
-def _button_rows(settings):
-    rows = settings.get("button_rows")
-    if rows:
-        return [[b for b in row if b.get("text") and b.get("url")] for row in rows if row]
-    # Backward compatibility with the old flat button format.
-    buttons = settings.get("buttons", [])
-    return [[b] for b in buttons if b.get("text") and b.get("url")]
-
-
 def protected_markup(settings):
-    rows = _button_rows(settings)
-    if not rows:
+    buttons = settings.get("buttons", [])
+    if not buttons:
         return None
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(b["text"], url=b["url"]) for b in row]
-        for row in rows
-    ])
-
-
-def parse_raw_buttons(text):
-    """Parse buttons from one message.
-
-    Each line is a row. Use `Text | URL` for one button.
-    Use `Text 1 | URL 1 || Text 2 | URL 2` for two buttons in the same row.
-    Blank lines are ignored.
-    """
-    rows = []
-    errors = []
-    for line_no, line in enumerate(text.splitlines(), 1):
-        line = line.strip()
-        if not line:
-            continue
-        row = []
-        for item in line.split("||"):
-            item = item.strip()
-            if not item:
-                continue
-            parts = [p.strip() for p in item.split("|", 1)]
-            if len(parts) != 2:
-                errors.append(f"Line {line_no}: use Text | URL")
-                continue
-            label, url = parts
-            if (not label or len(label) > 64 or
-                not url.startswith(("https://", "http://", "tg://"))):
-                errors.append(f"Line {line_no}: invalid text or URL")
-                continue
-            row.append({"text": label, "url": url})
-        if row:
-            rows.append(row)
-    return rows, errors
+    return InlineKeyboardMarkup([[InlineKeyboardButton(b["text"], url=b["url"])] for b in buttons])
 
 
 async def send_media(bot, chat_id, media, settings):
@@ -167,9 +122,8 @@ async def settings_page(q, context):
 async def editor_page(q, context):
     s = await db.get_settings()
     caption = s.get("caption") or "(empty)"
-    rows = _button_rows(s)
-    button_count = sum(len(row) for row in rows)
-    text = f"✏️ Caption & Buttons\n\nCaption:\n{caption[:700]}\n\nButtons: {button_count}\nRows: {len(rows)}"
+    buttons = s.get("buttons", [])
+    text = f"✏️ Caption & Buttons\n\nCaption:\n{caption[:700]}\n\nButtons: {len(buttons)}"
     await q.edit_message_text(text, reply_markup=editor_keyboard())
 
 
@@ -192,7 +146,7 @@ async def clear_caption(q, context):
 
 
 async def clear_buttons(q, context):
-    await db.update_settings({"buttons": [], "button_rows": []})
+    await db.update_settings({"buttons": []})
     await q.answer("Buttons cleared")
     await editor_page(q, context)
 
@@ -225,16 +179,7 @@ async def ask_button(update, context):
     q = update.callback_query
     await q.answer()
     context.user_data["editor_action"] = "button"
-    await q.edit_message_text(
-        "Send buttons in one message.\n\n"
-        "One button: Button Text | https://example.com\n"
-        "Same row: Button 1 | https://a.com || Button 2 | https://b.com\n"
-        "New line = new row. You can send all buttons at once.\n\n"
-        "Example:\n"
-        "👉 Only Local 👉 | https://t.me/example || 📢 Join | https://t.me/example2\n"
-        "🎬 Watch Now | https://example.com\n\n"
-        "Use /cancel to cancel."
-    )
+    await q.edit_message_text("Send button as:\nButton Text | https://example.com\n\nUse /cancel to cancel.")
     return WAIT_BUTTON
 
 
@@ -281,36 +226,22 @@ async def save_text(update, context):
 async def save_button(update, context):
     if not is_owner(update.effective_user.id):
         return ConversationHandler.END
-
     text = (update.effective_message.text or "").strip()
-    rows, errors = parse_raw_buttons(text)
-    if errors or not rows:
-        msg = "❌ Could not read the buttons.\n\n" + "\n".join(errors[:8])
-        msg += "\n\nUse: Button Text | https://example.com\n"
-        msg += "Same row: Button 1 | URL1 || Button 2 | URL2"
-        await update.effective_message.reply_text(msg)
+    if "|" not in text:
+        await update.effective_message.reply_text("❌ Format: Button Text | https://example.com")
         return WAIT_BUTTON
-
-    total_new = sum(len(row) for row in rows)
+    label, url = [x.strip() for x in text.split("|", 1)]
+    if not label or len(label) > 64 or not url.startswith(("https://", "http://", "tg://")):
+        await update.effective_message.reply_text("❌ Invalid button text or URL.")
+        return WAIT_BUTTON
     s = await db.get_settings()
-    current_rows = _button_rows(s)
-    current_count = sum(len(row) for row in current_rows)
-    if current_count + total_new > 20:
-        await update.effective_message.reply_text(
-            f"❌ Maximum 20 buttons. Current: {current_count}, new: {total_new}."
-        )
-        return WAIT_BUTTON
-
-    current_rows.extend(rows)
-    await db.update_settings({
-        "button_rows": current_rows,
-        # Keep the legacy field synchronized for older code/data.
-        "buttons": [b for row in current_rows for b in row],
-    })
-    await update.effective_message.reply_text(
-        f"✅ {total_new} button(s) added in {len(rows)} row(s).",
-        reply_markup=main_keyboard()
-    )
+    buttons = list(s.get("buttons", []))
+    if len(buttons) >= 20:
+        await update.effective_message.reply_text("❌ Maximum 20 buttons reached.")
+        return ConversationHandler.END
+    buttons.append({"text": label, "url": url})
+    await db.update_settings({"buttons": buttons})
+    await update.effective_message.reply_text("✅ Button added.", reply_markup=main_keyboard())
     return ConversationHandler.END
 
 
@@ -322,13 +253,12 @@ async def cancel(update, context):
 
 async def manage_buttons(q, context):
     s = await db.get_settings()
-    rows = _button_rows(s)
-    flat = [b for row in rows for b in row]
-    if not flat:
+    buttons = s.get("buttons", [])
+    if not buttons:
         await q.answer("No buttons")
         await editor_page(q, context)
         return
-    await q.edit_message_text("🗑 Tap a button to remove it:", reply_markup=button_manage_keyboard(flat))
+    await q.edit_message_text("🗑 Tap a button to remove it:", reply_markup=button_manage_keyboard(buttons))
 
 
 async def delete_button(q, context):
@@ -338,22 +268,10 @@ async def delete_button(q, context):
         await q.answer("Invalid")
         return
     s = await db.get_settings()
-    rows = _button_rows(s)
-    flat = [b for row in rows for b in row]
-    if 0 <= idx < len(flat):
-        removed = flat.pop(idx)
-        # Rebuild rows preserving order and removing only the selected button.
-        new_rows = []
-        pos = 0
-        for row in rows:
-            kept = []
-            for b in row:
-                if pos != idx:
-                    kept.append(b)
-                pos += 1
-            if kept:
-                new_rows.append(kept)
-        await db.update_settings({"button_rows": new_rows, "buttons": flat})
+    buttons = list(s.get("buttons", []))
+    if 0 <= idx < len(buttons):
+        removed = buttons.pop(idx)
+        await db.update_settings({"buttons": buttons})
         await q.answer(f"Removed: {removed['text'][:30]}")
     await manage_buttons(q, context)
 
@@ -514,7 +432,7 @@ async def delivery_loop(application):
             interval = max(1, int(settings.get("interval_minutes", 60)))
             at = db.now()
 
-            async for user in db.active_users_due(at):
+            async for user in await db.active_users_due(at):
                 try:
                     nxt, due = await deliver_one(application.bot, "user", user["user_id"], user.get("next_seq"), settings)
                     if due:
@@ -523,7 +441,7 @@ async def delivery_loop(application):
                     log.warning("User %s delivery failed: %s", user.get("user_id"), e)
                     await db.update_user_cursor(user["user_id"], user.get("next_seq"), at + timedelta(minutes=interval))
 
-            async for chat in db.active_chats_due(at):
+            async for chat in await db.active_chats_due(at):
                 try:
                     nxt, due = await deliver_one(application.bot, "chat", chat["chat_id"], chat.get("next_seq"), settings)
                     if due:
