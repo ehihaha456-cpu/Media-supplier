@@ -19,52 +19,61 @@ def is_owner(uid):
 
 
 def protected_markup(settings):
-    buttons = settings.get("buttons", [])
-    if not buttons:
+    raw = settings.get("buttons") or []
+    if not raw:
         return None
-    if buttons and isinstance(buttons[0], list):
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton(b["text"], url=b["url"]) for b in row]
-            for row in buttons
-        ])
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(b["text"], url=b["url"])]
-        for b in buttons
-    ])
+
+    # Normalize legacy and current button formats:
+    # 1) [{"text": "...", "url": "..."}]
+    # 2) [[{"text": "...", "url": "..."}, {...}], [...]]
+    # 3) [{"text": "...", "url": "..."}] nested one extra level
+    if isinstance(raw, dict):
+        raw = [raw]
+
+    if not isinstance(raw, (list, tuple)):
+        return None
+
+    rows = []
+    current = []
+
+    def add_button(item):
+        if isinstance(item, dict):
+            text = item.get("text")
+            url = item.get("url")
+            if text and url:
+                current.append(InlineKeyboardButton(text=str(text), url=str(url)))
+            return True
+        if isinstance(item, (list, tuple)):
+            for child in item:
+                add_button(child)
+            return True
+        return False
+
+    # Preserve row boundaries for normal 2-D input.
+    for item in raw:
+        if isinstance(item, dict):
+            current = []
+            add_button(item)
+            if current:
+                rows.append(current)
+        elif isinstance(item, (list, tuple)):
+            current = []
+            for child in item:
+                if isinstance(child, dict):
+                    add_button(child)
+                elif isinstance(child, (list, tuple)):
+                    add_button(child)
+            if current:
+                rows.append(current)
+
+    return InlineKeyboardMarkup(rows) if rows else None
 
 
 async def send_media(bot, chat_id, media, settings):
-    caption = settings.get("caption") or ""
-    raw_buttons = settings.get("buttons") or []
-
-    # Support both:
-    # old format: [{"text": "...", "url": "..."}]
-    # new format: [[{"text": "...", "url": "..."}, {"text": "...", "url": "..."}], ...]
-    if raw_buttons and isinstance(raw_buttons[0], dict):
-        button_rows = [raw_buttons]
-    else:
-        button_rows = raw_buttons
-
-    keyboard = []
-    for row in button_rows:
-        if not isinstance(row, list):
-            continue
-        out_row = []
-        for button in row:
-            if not isinstance(button, dict):
-                continue
-            text = button.get("text")
-            url = button.get("url")
-            if text and url:
-                out_row.append(InlineKeyboardButton(text=text, url=url))
-        if out_row:
-            keyboard.append(out_row)
-
-    markup = InlineKeyboardMarkup(keyboard) if keyboard else None
     kwargs = {
-        "caption": caption[:1024],
-        "reply_markup": markup,
-        "protect_content": bool(settings.get("protect_content", False)),
+        "caption": (settings.get("caption") or "")[:1024],
+        "reply_markup": protected_markup(settings),
+        "protect_content": bool(settings.get("protect_content", True)),
     }
 
     kind = media.get("kind")
@@ -73,13 +82,14 @@ async def send_media(bot, chat_id, media, settings):
         raise ValueError("Media file_id is missing")
 
     if kind == "video":
-        await bot.send_video(chat_id=chat_id, video=file_id, **kwargs)
-    elif kind == "photo":
-        await bot.send_photo(chat_id=chat_id, photo=file_id, **kwargs)
-    elif kind == "document":
-        await bot.send_document(chat_id=chat_id, document=file_id, **kwargs)
-    else:
-        raise ValueError(f"Unsupported media kind: {kind}")
+        return await bot.send_video(chat_id=chat_id, video=file_id, **kwargs)
+    if kind == "photo":
+        return await bot.send_photo(chat_id=chat_id, photo=file_id, **kwargs)
+    if kind == "document":
+        return await bot.send_document(chat_id=chat_id, document=file_id, **kwargs)
+
+    raise ValueError(f"Unsupported media kind: {kind}")
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not update.effective_message:
@@ -95,9 +105,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if oldest:
         try:
             await send_media(context.bot, update.effective_user.id, oldest, s)
-            await db.update_user_cursor(update.effective_user.id, oldest["seq"] + 1, db.now() + timedelta(minutes=int(s.get("interval_minutes", 60))))
+            await db.update_user_cursor(
+                update.effective_user.id,
+                oldest["seq"] + 1,
+                db.now() + timedelta(minutes=int(s.get("interval_minutes", 60))),
+            )
         except Exception:
             log.exception("Initial media delivery failed")
+            # A malformed legacy button configuration must never stop media delivery.
+            try:
+                clean = dict(s)
+                clean["buttons"] = []
+                await send_media(context.bot, update.effective_user.id, oldest, clean)
+                await db.update_user_cursor(
+                    update.effective_user.id,
+                    oldest["seq"] + 1,
+                    db.now() + timedelta(minutes=int(s.get("interval_minutes", 60))),
+                )
+            except Exception:
+                log.exception("Initial media delivery fallback failed")
 
 
 async def stop(update, context):
@@ -622,8 +648,8 @@ async def delivery_loop(application):
                             chat.get("next_seq"),
                             at + timedelta(minutes=interval),
                         )
-                except Exception as exc:
-                    log.exception("Chat %s delivery failed: %s", chat.get("chat_id"), exc)
+                except Exception:
+                    log.exception("Chat %s delivery failed", chat.get("chat_id"))
                     await db.update_chat_cursor(
                         chat["chat_id"],
                         chat.get("next_seq"),
