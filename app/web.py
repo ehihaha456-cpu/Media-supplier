@@ -1,3 +1,4 @@
+
 import asyncio
 import logging
 import threading
@@ -13,11 +14,9 @@ _loop = None
 _ready = threading.Event()
 _error = None
 
-
 def _runner():
     asyncio.set_event_loop(_loop)
     _loop.run_forever()
-
 
 def _start_bot():
     global _application, _loop, _error
@@ -28,13 +27,13 @@ def _start_bot():
 
         async def boot():
             await _application.initialize()
-            await initialize(_application)
             await _application.start()
             await _application.updater.start_polling(
-                allowed_updates=None,
+                allowed_updates=["message", "callback_query", "my_chat_member", "channel_post"],
                 drop_pending_updates=False,
             )
-            log.info("Telegram polling started successfully")
+            await initialize(_application)
+            log.info("Telegram polling + media delivery started")
 
         asyncio.run_coroutine_threadsafe(boot(), _loop).result(timeout=90)
         _ready.set()
@@ -42,14 +41,11 @@ def _start_bot():
         _error = repr(exc)
         log.exception("Telegram bot startup failed")
 
-
 threading.Thread(target=_start_bot, daemon=True, name="telegram-bootstrap").start()
-
 
 @app.get("/")
 def root():
     return "Auto Media Delivery Bot is running", 200
-
 
 @app.get("/health")
 def health():

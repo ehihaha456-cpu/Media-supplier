@@ -3,7 +3,7 @@ import logging
 from datetime import timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatType
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ChatMemberHandler, ContextTypes, ConversationHandler, filters
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ChatMemberHandler, ChannelPostHandler, ContextTypes, ConversationHandler, filters
 from . import db
 from .config import BOT_TOKEN, OWNER_IDS
 from .keyboards import main_keyboard, settings_keyboard, editor_keyboard, source_keyboard, chat_keyboard, button_manage_keyboard
@@ -22,7 +22,15 @@ def protected_markup(settings):
     buttons = settings.get("buttons", [])
     if not buttons:
         return None
-    return InlineKeyboardMarkup([[InlineKeyboardButton(b["text"], url=b["url"])] for b in buttons])
+    if buttons and isinstance(buttons[0], list):
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton(b["text"], url=b["url"]) for b in row]
+            for row in buttons
+        ])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(b["text"], url=b["url"])]
+        for b in buttons
+    ])
 
 
 async def send_media(bot, chat_id, media, settings):
@@ -221,9 +229,7 @@ async def save_text(update, context):
             return WAIT_TEXT
         await db.update_settings({"storage_limit": n})
         # Trigger trimming by re-saving settings and removing excess records.
-        docs = await db.db.media.find({}, {"_id": 1, "seq": 1}).sort("seq", -1).to_list(length=n + 1000)
-        if len(docs) > n:
-            await db.db.media.delete_many({"_id": {"$in": [d["_id"] for d in docs[n:]]}})
+        await db.trim_to_limit(n)
         await update.effective_message.reply_text(f"✅ Storage limit set to {n}.", reply_markup=main_keyboard())
     elif action == "interval":
         try:
@@ -261,42 +267,36 @@ async def save_button(update, context):
             if "|" not in item:
                 await update.effective_message.reply_text(
                     "❌ Format error.\n\n"
-                    "Use:\n"
                     "Button Text | https://example.com\n\n"
                     "Same row:\n"
                     "Button 1 | URL1 || Button 2 | URL2"
                 )
                 return WAIT_BUTTON
+
             label, url = [x.strip() for x in item.split("|", 1)]
             if (
-                not label
-                or len(label) > 64
-                or not url.startswith(("https://", "http://", "tg://"))
+                not label or len(label) > 64 or
+                not url.startswith(("https://", "http://", "tg://"))
             ):
-                await update.effective_message.reply_text(
-                    f"❌ Invalid button:\n{label or '(empty)'}"
-                )
+                await update.effective_message.reply_text("❌ Invalid button text or URL.")
                 return WAIT_BUTTON
+
             row.append({"text": label, "url": url})
             total += 1
             if total > 20:
-                await update.effective_message.reply_text(
-                    "❌ Maximum 20 buttons allowed."
-                )
+                await update.effective_message.reply_text("❌ Maximum 20 buttons allowed.")
                 return WAIT_BUTTON
+
         rows.append(row)
 
     if not rows:
         await update.effective_message.reply_text("❌ No buttons found.")
         return WAIT_BUTTON
 
-    s = await db.get_settings()
     await db.update_settings({"buttons": rows})
-
     await update.effective_message.reply_text(
-        f"✅ {total} button(s) saved.\n"
-        f"Rows: {len(rows)}\n\n"
-        "You can open Editor → Preview to check them."
+        f"✅ {total} button(s) saved in {len(rows)} row(s).",
+        reply_markup=main_keyboard(await db.get_settings()),
     )
     return ConversationHandler.END
 
@@ -441,7 +441,6 @@ async def clear_source(update, context):
 async def source_help(update, context):
     q = update.callback_query
     await q.answer()
-    await q.answer()
     await q.edit_message_text("Add the bot to your source group, make sure it can see messages, then send /setsource in that group as the owner.\n\nThe bot will capture new videos/photos/documents from that group automatically.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="source_menu")]]))
 
 
@@ -456,6 +455,19 @@ async def setsource(update, context):
     await update.effective_message.reply_text("✅ This chat is now the source. New media posted here will be stored automatically.")
 
 
+async def enable_chat(update, context):
+    if not update.effective_user or not is_owner(update.effective_user.id):
+        return
+    chat = update.effective_chat
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL):
+        await update.effective_message.reply_text("Use /enablechat inside a group or channel.")
+        return
+    await db.upsert_chat(chat.id, chat.type, chat.title or "", active=True)
+    await update.effective_message.reply_text(
+        "✅ This group/channel is registered for automatic media delivery."
+    )
+
+
 async def chat_membership(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cm = update.my_chat_member
     if not cm:
@@ -468,71 +480,128 @@ async def chat_membership(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def source_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_chat or not update.effective_message:
-        return
-    source_id = await db.get_source_chat_id()
-    if source_id is None or update.effective_chat.id != source_id:
-        return
+    chat = update.effective_chat
     msg = update.effective_message
+    if not chat or not msg:
+        return
+
+    source_id = await db.get_source_chat_id()
+    if source_id is None or chat.id != source_id:
+        return
+
     if msg.video:
-        await db.save_media("video", msg.video.file_id)
-        log.info("Captured video from source chat %s", update.effective_chat.id)
+        seq = await db.save_media("video", msg.video.file_id)
+        if seq:
+            log.info("Captured video seq=%s from source %s", seq, chat.id)
     elif msg.photo:
-        await db.save_media("photo", msg.photo[-1].file_id)
-        log.info("Captured photo from source chat %s", update.effective_chat.id)
+        seq = await db.save_media("photo", msg.photo[-1].file_id)
+        if seq:
+            log.info("Captured photo seq=%s from source %s", seq, chat.id)
     elif msg.document:
-        # Store only document media; text files etc. are ignored.
-        if msg.document.mime_type and (msg.document.mime_type.startswith("video/") or msg.document.mime_type.startswith("image/")):
-            await db.save_media("document", msg.document.file_id)
+        mime = msg.document.mime_type or ""
+        if mime.startswith("video/") or mime.startswith("image/"):
+            seq = await db.save_media("document", msg.document.file_id)
+            if seq:
+                log.info("Captured document seq=%s from source %s", seq, chat.id)
 
 
-async def deliver_one(bot, target_type, target_id, cursor, settings):
+async def deliver_one(bot, target_id, cursor, settings):
     oldest = await db.oldest_media()
     if not oldest:
-        return None, None
+        return None, None, False
+
     if cursor is None or cursor < oldest["seq"]:
         cursor = oldest["seq"]
+
     media = await db.get_media_by_seq(cursor)
     if not media:
-        # Cursor may point to a deleted gap; jump to oldest retained media.
-        cursor = oldest["seq"]
-        media = oldest
+        latest = await db.latest_media()
+        if not latest:
+            return None, None, False
+        cursor = latest["seq"]
+        media = latest
+
     await send_media(bot, target_id, media, settings)
-    return media["seq"] + 1, db.now() + timedelta(minutes=int(settings.get("interval_minutes", 60)))
+
+    next_seq = media["seq"] + 1
+    next_due = db.now() + timedelta(minutes=max(1, int(settings.get("interval_minutes", 60))))
+    return next_seq, next_due, True
 
 
 async def delivery_loop(application):
     while True:
         try:
             settings = await db.get_settings()
-            if not bool(settings.get("delivery_enabled", True)):
-                await asyncio.sleep(10)
+            if not settings:
+                await asyncio.sleep(5)
                 continue
-            interval = max(1, int(settings.get("interval_minutes", 60)))
+
+            if not bool(settings.get("delivery_enabled", True)):
+                await asyncio.sleep(5)
+                continue
+
             at = db.now()
+            interval = max(1, int(settings.get("interval_minutes", 60)))
 
-            async for user in await db.active_users_due(at):
+            # Users
+            user_cursor = await db.active_users_due(at)
+            async for user in user_cursor:
                 try:
-                    nxt, due = await deliver_one(application.bot, "user", user["user_id"], user.get("next_seq"), settings)
-                    if due:
+                    nxt, due, sent = await deliver_one(
+                        application.bot,
+                        user["user_id"],
+                        user.get("next_seq"),
+                        settings,
+                    )
+                    if sent:
                         await db.update_user_cursor(user["user_id"], nxt, due)
-                except Exception as e:
-                    log.warning("User %s delivery failed: %s", user.get("user_id"), e)
-                    await db.update_user_cursor(user["user_id"], user.get("next_seq"), at + timedelta(minutes=interval))
+                    else:
+                        # No media yet: retry after the configured interval, not every 10 sec.
+                        await db.update_user_cursor(
+                            user["user_id"],
+                            user.get("next_seq"),
+                            at + timedelta(minutes=interval),
+                        )
+                except Exception as exc:
+                    log.exception("User %s delivery failed", user.get("user_id"))
+                    await db.update_user_cursor(
+                        user["user_id"],
+                        user.get("next_seq"),
+                        at + timedelta(minutes=interval),
+                    )
 
-            async for chat in await db.active_chats_due(at):
+            # Groups / channels
+            chat_cursor = await db.active_chats_due(at)
+            async for chat in chat_cursor:
                 try:
-                    nxt, due = await deliver_one(application.bot, "chat", chat["chat_id"], chat.get("next_seq"), settings)
-                    if due:
+                    nxt, due, sent = await deliver_one(
+                        application.bot,
+                        chat["chat_id"],
+                        chat.get("next_seq"),
+                        settings,
+                    )
+                    if sent:
                         await db.update_chat_cursor(chat["chat_id"], nxt, due)
-                except Exception as e:
-                    log.warning("Chat %s delivery failed: %s", chat.get("chat_id"), e)
-                    await db.update_chat_cursor(chat["chat_id"], chat.get("next_seq"), at + timedelta(minutes=interval))
+                    else:
+                        await db.update_chat_cursor(
+                            chat["chat_id"],
+                            chat.get("next_seq"),
+                            at + timedelta(minutes=interval),
+                        )
+                except Exception:
+                    log.exception("Chat %s delivery failed", chat.get("chat_id"))
+                    await db.update_chat_cursor(
+                        chat["chat_id"],
+                        chat.get("next_seq"),
+                        at + timedelta(minutes=interval),
+                    )
+
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception("Delivery loop error")
-        await asyncio.sleep(10)
+
+        await asyncio.sleep(5)
 
 
 async def initialize(application):
@@ -549,6 +618,7 @@ def build_application():
     app.add_handler(CommandHandler("admin", admin))
     app.add_handler(CommandHandler("diag", diag))
     app.add_handler(CommandHandler("setsource", setsource))
+    app.add_handler(CommandHandler("enablechat", enable_chat))
 
     conv = ConversationHandler(
         entry_points=[
@@ -587,4 +657,5 @@ def build_application():
     app.add_handler(CallbackQueryHandler(home, pattern="^home$"))
     app.add_handler(ChatMemberHandler(chat_membership, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, source_media))
+    app.add_handler(ChannelPostHandler(source_media))
     return app
