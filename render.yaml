@@ -3,7 +3,7 @@ services:
     name: auto-media-delivery-bot
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn -w 1 -b 0.0.0.0:$PORT app.web:app
+    startCommand: gunicorn -w 1 --threads 4 -b 0.0.0.0:$PORT app.web:app
     envVars:
       - key: BOT_TOKEN
         sync: false
@@ -12,6 +12,8 @@ services:
       - key: MONGO_DB
         value: auto_media_bot
       - key: OWNER_IDS
+        sync: false
+      - key: WEBHOOK_SECRET
         sync: false
       - key: DEFAULT_STORAGE_LIMIT
         value: "20"
