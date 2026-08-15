@@ -3,7 +3,7 @@ import logging
 from datetime import timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatType
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ChatMemberHandler, ChannelPostHandler, ContextTypes, ConversationHandler, filters
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ChatMemberHandler, ContextTypes, ConversationHandler, filters
 from . import db
 from .config import BOT_TOKEN, OWNER_IDS
 from .keyboards import main_keyboard, settings_keyboard, editor_keyboard, source_keyboard, chat_keyboard, button_manage_keyboard
@@ -19,76 +19,32 @@ def is_owner(uid):
 
 
 def protected_markup(settings):
-    raw = settings.get("buttons") or []
-    if not raw:
+    buttons = settings.get("buttons", [])
+    if not buttons:
         return None
-
-    # Normalize legacy and current button formats:
-    # 1) [{"text": "...", "url": "..."}]
-    # 2) [[{"text": "...", "url": "..."}, {...}], [...]]
-    # 3) [{"text": "...", "url": "..."}] nested one extra level
-    if isinstance(raw, dict):
-        raw = [raw]
-
-    if not isinstance(raw, (list, tuple)):
-        return None
-
-    rows = []
-    current = []
-
-    def add_button(item):
-        if isinstance(item, dict):
-            text = item.get("text")
-            url = item.get("url")
-            if text and url:
-                current.append(InlineKeyboardButton(text=str(text), url=str(url)))
-            return True
-        if isinstance(item, (list, tuple)):
-            for child in item:
-                add_button(child)
-            return True
-        return False
-
-    # Preserve row boundaries for normal 2-D input.
-    for item in raw:
-        if isinstance(item, dict):
-            current = []
-            add_button(item)
-            if current:
-                rows.append(current)
-        elif isinstance(item, (list, tuple)):
-            current = []
-            for child in item:
-                if isinstance(child, dict):
-                    add_button(child)
-                elif isinstance(child, (list, tuple)):
-                    add_button(child)
-            if current:
-                rows.append(current)
-
-    return InlineKeyboardMarkup(rows) if rows else None
+    if buttons and isinstance(buttons[0], list):
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton(b["text"], url=b["url"]) for b in row]
+            for row in buttons
+        ])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(b["text"], url=b["url"])]
+        for b in buttons
+    ])
 
 
 async def send_media(bot, chat_id, media, settings):
     kwargs = {
-        "caption": (settings.get("caption") or "")[:1024],
+        "caption": settings.get("caption", "")[:1024],
         "reply_markup": protected_markup(settings),
         "protect_content": bool(settings.get("protect_content", True)),
     }
-
-    kind = media.get("kind")
-    file_id = media.get("file_id")
-    if not file_id:
-        raise ValueError("Media file_id is missing")
-
-    if kind == "video":
-        return await bot.send_video(chat_id=chat_id, video=file_id, **kwargs)
-    if kind == "photo":
-        return await bot.send_photo(chat_id=chat_id, photo=file_id, **kwargs)
-    if kind == "document":
-        return await bot.send_document(chat_id=chat_id, document=file_id, **kwargs)
-
-    raise ValueError(f"Unsupported media kind: {kind}")
+    if media["kind"] == "video":
+        return await bot.send_video(chat_id, media["file_id"], **kwargs)
+    if media["kind"] == "photo":
+        return await bot.send_photo(chat_id, media["file_id"], **kwargs)
+    if media["kind"] == "document":
+        return await bot.send_document(chat_id, media["file_id"], **kwargs)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -105,25 +61,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if oldest:
         try:
             await send_media(context.bot, update.effective_user.id, oldest, s)
-            await db.update_user_cursor(
-                update.effective_user.id,
-                oldest["seq"] + 1,
-                db.now() + timedelta(minutes=int(s.get("interval_minutes", 60))),
-            )
+            await db.update_user_cursor(update.effective_user.id, oldest["seq"] + 1, db.now() + timedelta(minutes=int(s.get("interval_minutes", 60))))
         except Exception:
             log.exception("Initial media delivery failed")
-            # A malformed legacy button configuration must never stop media delivery.
-            try:
-                clean = dict(s)
-                clean["buttons"] = []
-                await send_media(context.bot, update.effective_user.id, oldest, clean)
-                await db.update_user_cursor(
-                    update.effective_user.id,
-                    oldest["seq"] + 1,
-                    db.now() + timedelta(minutes=int(s.get("interval_minutes", 60))),
-                )
-            except Exception:
-                log.exception("Initial media delivery fallback failed")
 
 
 async def stop(update, context):
@@ -717,5 +657,5 @@ def build_application():
     app.add_handler(CallbackQueryHandler(home, pattern="^home$"))
     app.add_handler(ChatMemberHandler(chat_membership, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, source_media))
-    app.add_handler(ChannelPostHandler(source_media))
+    app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS, source_media))
     return app
