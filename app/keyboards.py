@@ -67,11 +67,19 @@ def chat_keyboard(chats):
     return InlineKeyboardMarkup(rows)
 
 def button_manage_keyboard(buttons):
+    if buttons and isinstance(buttons[0], dict):
+        buttons = [buttons]
+
     rows = []
-    for i, b in enumerate(buttons):
-        rows.append([InlineKeyboardButton(
-            f"🗑 {b['text'][:35]}",
-            callback_data=f"delete_button:{i}"
-        )])
+    for r_idx, row in enumerate(buttons or []):
+        if not isinstance(row, list):
+            continue
+        for c_idx, b in enumerate(row):
+            if isinstance(b, dict):
+                rows.append([InlineKeyboardButton(
+                    f"🗑 {str(b.get('text', ''))[:35]}",
+                    callback_data=f"delete_button:{r_idx}:{c_idx}"
+                )])
+
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data="editor")])
     return InlineKeyboardMarkup(rows)

@@ -18,33 +18,64 @@ def is_owner(uid):
     return uid in OWNER_IDS
 
 
+def _button_rows(raw_buttons):
+    if not isinstance(raw_buttons, list):
+        return []
+
+    # Old format: [{"text": "...", "url": "..."}]
+    if raw_buttons and all(isinstance(x, dict) for x in raw_buttons):
+        raw_buttons = [raw_buttons]
+
+    rows = []
+    for raw_row in raw_buttons:
+        if isinstance(raw_row, dict):
+            raw_row = [raw_row]
+        if not isinstance(raw_row, list):
+            continue
+
+        row = []
+        for b in raw_row:
+            if not isinstance(b, dict):
+                continue
+            text = str(b.get("text", "")).strip()
+            url = str(b.get("url", "")).strip()
+            if not text or not url:
+                continue
+            if not url.startswith(("https://", "http://", "tg://")):
+                continue
+            row.append(InlineKeyboardButton(text=text[:64], url=url))
+        if row:
+            rows.append(row)
+
+    return rows
+
+
 def protected_markup(settings):
-    buttons = settings.get("buttons", [])
-    if not buttons:
-        return None
-    if buttons and isinstance(buttons[0], list):
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton(b["text"], url=b["url"]) for b in row]
-            for row in buttons
-        ])
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(b["text"], url=b["url"])]
-        for b in buttons
-    ])
+    rows = _button_rows((settings or {}).get("buttons", []))
+    return InlineKeyboardMarkup(rows) if rows else None
 
 
 async def send_media(bot, chat_id, media, settings):
+    settings = settings or {}
     kwargs = {
-        "caption": settings.get("caption", "")[:1024],
+        "caption": (settings.get("caption") or "")[:1024],
         "reply_markup": protected_markup(settings),
         "protect_content": bool(settings.get("protect_content", True)),
     }
-    if media["kind"] == "video":
-        return await bot.send_video(chat_id, media["file_id"], **kwargs)
-    if media["kind"] == "photo":
-        return await bot.send_photo(chat_id, media["file_id"], **kwargs)
-    if media["kind"] == "document":
-        return await bot.send_document(chat_id, media["file_id"], **kwargs)
+
+    kind = media.get("kind")
+    file_id = media.get("file_id")
+    if not file_id:
+        raise ValueError("Media file_id is missing")
+
+    if kind == "video":
+        return await bot.send_video(chat_id=chat_id, video=file_id, **kwargs)
+    if kind == "photo":
+        return await bot.send_photo(chat_id=chat_id, photo=file_id, **kwargs)
+    if kind == "document":
+        return await bot.send_document(chat_id=chat_id, document=file_id, **kwargs)
+
+    raise ValueError(f"Unsupported media kind: {kind}")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -127,31 +158,35 @@ async def test_send(update, context):
 
 
 async def settings_page(update, context):
-    q = update.callback_query
+    q = update.callback_query if hasattr(update, 'callback_query') else update
     await q.answer()
     s = await db.get_settings()
     await q.edit_message_text("⚙️ Settings", reply_markup=settings_keyboard(s))
 
 
 async def editor_page(update, context):
-    q = update.callback_query
+    q = update.callback_query if hasattr(update, 'callback_query') else update
     await q.answer()
     s = await db.get_settings()
     caption = s.get("caption") or "(empty)"
     buttons = s.get("buttons", [])
-    text = f"✏️ Caption & Buttons\n\nCaption:\n{caption[:700]}\n\nButtons: {len(buttons)}"
+    if buttons and isinstance(buttons[0], list):
+        button_count = sum(len(r) for r in buttons if isinstance(r, list))
+    else:
+        button_count = len(buttons)
+    text = f"✏️ Caption & Buttons\n\nCaption:\n{caption[:700]}\n\nButtons: {button_count}"
     await q.edit_message_text(text, reply_markup=editor_keyboard())
 
 
 async def home(update, context):
-    q = update.callback_query
+    q = update.callback_query if hasattr(update, 'callback_query') else update
     await q.answer()
     s = await db.get_settings()
     await q.edit_message_text("🛠 Admin Panel", reply_markup=main_keyboard(s))
 
 
 async def toggle_protect(update, context):
-    q = update.callback_query
+    q = update.callback_query if hasattr(update, 'callback_query') else update
     await q.answer()
     s = await db.get_settings()
     await db.update_settings({"protect_content": not bool(s.get("protect_content", True))})
@@ -160,7 +195,7 @@ async def toggle_protect(update, context):
 
 
 async def clear_caption(update, context):
-    q = update.callback_query
+    q = update.callback_query if hasattr(update, 'callback_query') else update
     await q.answer()
     await db.update_settings({"caption": ""})
     await q.answer("Caption cleared")
@@ -168,7 +203,7 @@ async def clear_caption(update, context):
 
 
 async def clear_buttons(update, context):
-    q = update.callback_query
+    q = update.callback_query if hasattr(update, 'callback_query') else update
     await q.answer()
     await db.update_settings({"buttons": []})
     await q.answer("Buttons cleared")
@@ -307,7 +342,7 @@ async def cancel(update, context):
 
 
 async def manage_buttons(update, context):
-    q = update.callback_query
+    q = update.callback_query if hasattr(update, 'callback_query') else update
     await q.answer()
     s = await db.get_settings()
     buttons = s.get("buttons", [])
@@ -319,19 +354,32 @@ async def manage_buttons(update, context):
 
 
 async def delete_button(update, context):
-    q = update.callback_query
+    q = update.callback_query if hasattr(update, "callback_query") else update
     await q.answer()
+
     try:
-        idx = int(q.data.split(":", 1)[1])
+        parts = q.data.split(":")
+        row_idx = int(parts[1])
+        col_idx = int(parts[2]) if len(parts) > 2 else 0
     except Exception:
-        await q.answer("Invalid")
+        await q.answer("Invalid button", show_alert=True)
         return
-    s = await db.get_settings()
-    buttons = list(s.get("buttons", []))
-    if 0 <= idx < len(buttons):
-        removed = buttons.pop(idx)
-        await db.update_settings({"buttons": buttons})
-        await q.answer(f"Removed: {removed['text'][:30]}")
+
+    settings = await db.get_settings()
+    buttons = settings.get("buttons", [])
+
+    if buttons and isinstance(buttons[0], dict):
+        buttons = [buttons]
+
+    rows = [list(r) for r in buttons if isinstance(r, list)]
+    if 0 <= row_idx < len(rows) and 0 <= col_idx < len(rows[row_idx]):
+        removed = rows[row_idx].pop(col_idx)
+        rows = [r for r in rows if r]
+        await db.update_settings({"buttons": rows})
+        await q.answer(f"Removed: {removed.get('text', '')[:30]}")
+    else:
+        await q.answer("Button not found", show_alert=True)
+
     await manage_buttons(q, context)
 
 
@@ -391,7 +439,7 @@ async def users_page(update, context):
 
 
 async def chats_page(update, context):
-    q = update.callback_query
+    q = update.callback_query if hasattr(update, 'callback_query') else update
     await q.answer()
     chats = await db.list_chats()
     if not chats:
@@ -401,7 +449,7 @@ async def chats_page(update, context):
 
 
 async def toggle_chat(update, context):
-    q = update.callback_query
+    q = update.callback_query if hasattr(update, 'callback_query') else update
     await q.answer()
     chat_id = int(q.data.split(":", 1)[1])
     chat = await db.db.chats.find_one({"chat_id": chat_id})
@@ -415,14 +463,14 @@ async def toggle_chat(update, context):
 
 
 async def source_menu(update, context):
-    q = update.callback_query
+    q = update.callback_query if hasattr(update, 'callback_query') else update
     await q.answer()
     chats = await db.list_chats()
     await q.edit_message_text("🎯 Select the source group/channel. Media posted there will be captured automatically.", reply_markup=source_keyboard(chats))
 
 
 async def set_source(update, context):
-    q = update.callback_query
+    q = update.callback_query if hasattr(update, 'callback_query') else update
     await q.answer()
     chat_id = int(q.data.split(":", 1)[1])
     await db.set_source_chat(chat_id)
@@ -431,7 +479,7 @@ async def set_source(update, context):
 
 
 async def clear_source(update, context):
-    q = update.callback_query
+    q = update.callback_query if hasattr(update, 'callback_query') else update
     await q.answer()
     await db.clear_source_chat()
     await q.answer("Source cleared")
