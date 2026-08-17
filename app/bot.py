@@ -1,5 +1,10 @@
 import asyncio
 import logging
+import os
+import json
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
 from datetime import timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatType
@@ -397,23 +402,125 @@ async def library(update, context):
     await q.edit_message_text(text, reply_markup=main_keyboard())
 
 
+
+async def get_render_bandwidth():
+    """Return current-month Render outbound bandwidth usage.
+
+    Render's bandwidth API returns measured bandwidth data points. The
+    dashboard graph is hourly, so this is a usage meter rather than a
+    second-by-second live counter.
+    """
+    api_key = os.getenv("RENDER_API_KEY", "").strip()
+    service_id = os.getenv("RENDER_SERVICE_ID", "").strip()
+    if not api_key or not service_id:
+        return None
+
+    try:
+        now = datetime.now(timezone.utc)
+        month_start = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
+        params = urllib.parse.urlencode({
+            "startTime": month_start.isoformat().replace("+00:00", "Z"),
+            "endTime": now.isoformat().replace("+00:00", "Z"),
+            "resource": service_id,
+        })
+        url = "https://api.render.com/v1/metrics/bandwidth?" + params
+        request = urllib.request.Request(
+            url,
+            headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
+            method="GET",
+        )
+
+        def fetch():
+            with urllib.request.urlopen(request, timeout=8) as response:
+                return json.loads(response.read().decode("utf-8"))
+
+        data = await asyncio.to_thread(fetch)
+
+        points = []
+        if isinstance(data, list):
+            points = data
+        elif isinstance(data, dict):
+            points = data.get("data") or data.get("metrics") or data.get("points") or []
+
+        total_bytes = 0.0
+        for point in points:
+            if isinstance(point, dict):
+                value = point.get("value")
+                if value is None:
+                    value = point.get("bytes")
+                if value is None:
+                    value = point.get("bandwidth")
+                if isinstance(value, (int, float)):
+                    total_bytes += float(value)
+            elif isinstance(point, (int, float)):
+                total_bytes += float(point)
+
+        # Render Hobby includes 5 GB/month. Allow overriding this for other plans.
+        limit_gb = float(os.getenv("RENDER_BANDWIDTH_LIMIT_GB", "5"))
+        limit_bytes = limit_gb * 1024**3
+        used_gb = total_bytes / 1024**3
+        remaining_gb = max(0.0, limit_gb - used_gb)
+        percent = (used_gb / limit_gb * 100.0) if limit_gb > 0 else 0.0
+
+        return {
+            "used_gb": used_gb,
+            "limit_gb": limit_gb,
+            "remaining_gb": remaining_gb,
+            "percent": percent,
+        }
+    except Exception as exc:
+        log.warning("Render bandwidth lookup failed: %s", exc)
+        return None
+
+
+def _bandwidth_bar(percent, width=10):
+    filled = max(0, min(width, round(percent / 100 * width)))
+    return "█" * filled + "░" * (width - filled)
+
 async def status(update, context):
     q = update.callback_query
     await q.answer()
+
     s = await db.get_settings()
     users = await db.db.users.count_documents({"active": True})
     chats = await db.db.chats.count_documents({"active": True, "delivery_enabled": True})
     media = await db.media_count()
     source = s.get("source_chat_id") or "Not set"
+
+    interval = int(s.get("interval_seconds", s.get("interval_minutes", 60)))
+    if interval >= 60 and interval % 60 == 0:
+        interval_text = f"{interval // 60} min"
+    else:
+        interval_text = f"{interval} sec"
+
+    bw = await get_render_bandwidth()
+
     text = (
         "📊 Bot Status\n\n"
         f"Active users: {users}\n"
         f"Active delivery chats: {chats}\n"
         f"Source media: {media}\n"
-        f"Interval: {s.get('interval_minutes')} min\n"
+        f"Interval: {interval_text}\n"
         f"Protection: {'ON' if s.get('protect_content') else 'OFF'}\n"
-        f"Source chat: {source}"
+        f"Source chat: {source}\n"
     )
+
+    if bw is None:
+        text += (
+            "\n🌐 Render Bandwidth\n"
+            "Not configured\n"
+            "Set RENDER_API_KEY and RENDER_SERVICE_ID."
+        )
+    else:
+        text += (
+            "\n🌐 Render Bandwidth (current month)\n"
+            f"{_bandwidth_bar(bw['percent'])} "
+            f"{bw['percent']:.1f}%\n"
+            f"Used: {bw['used_gb']:.2f} GB / {bw['limit_gb']:.2f} GB\n"
+            f"Remaining: {bw['remaining_gb']:.2f} GB\n"
+            "Note: Render reports bandwidth in hourly data points."
+        )
+
     await q.edit_message_text(text, reply_markup=main_keyboard())
 
 
