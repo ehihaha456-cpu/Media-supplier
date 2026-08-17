@@ -210,7 +210,7 @@ async def ask_storage(update, context):
     q = update.callback_query
     await q.answer()
     context.user_data["editor_action"] = "storage"
-    await q.edit_message_text("Send the maximum media count (example: 10 or 20).\n\nUse /cancel to cancel.")
+    await q.edit_message_text("Send the maximum number of bot media messages to keep visible in each user/group/channel chat (example: 10 or 20).\n\nThe source Media Library keeps ALL source media.\n\nUse /cancel to cancel.")
     return WAIT_TEXT
 
 
@@ -251,9 +251,12 @@ async def save_text(update, context):
             context.user_data["editor_action"] = "storage"
             return WAIT_TEXT
         await db.update_settings({"storage_limit": n})
-        # Trigger trimming by re-saving settings and removing excess records.
-        await db.trim_to_limit(n)
-        await update.effective_message.reply_text(f"✅ Storage limit set to {n}.", reply_markup=main_keyboard())
+        await update.effective_message.reply_text(
+            f"✅ Chat media limit set to {n}.\n\n"
+            "This only controls how many bot-sent media messages remain visible "
+            "in each recipient chat. The source Media Library is not deleted.",
+            reply_markup=main_keyboard(),
+        )
     elif action == "interval":
         try:
             n = int(text)
@@ -377,11 +380,20 @@ async def library(update, context):
     oldest = await db.oldest_media()
     latest = await db.latest_media()
     s = await db.get_settings()
-    text = f"📦 Media Library\n\nStored: {count}/{s.get('storage_limit')}\n"
+    limit = int(s.get("storage_limit", 10))
+    text = (
+        "📦 Media Library\n\n"
+        f"Source media: {count}\n"
+        f"Chat media limit: {limit}\n\n"
+        "The source library keeps all captured media.\n"
+    )
     if oldest:
-        text += f"Oldest sequence: {oldest['seq']}\nLatest sequence: {latest['seq']}"
+        text += (
+            f"Oldest sequence: {oldest['seq']}\n"
+            f"Latest sequence: {latest['seq']}"
+        )
     else:
-        text += "No media uploaded yet."
+        text += "No source media uploaded yet."
     await q.edit_message_text(text, reply_markup=main_keyboard())
 
 
@@ -397,7 +409,7 @@ async def status(update, context):
         "📊 Bot Status\n\n"
         f"Active users: {users}\n"
         f"Active delivery chats: {chats}\n"
-        f"Stored media: {media}/{s.get('storage_limit')}\n"
+        f"Source media: {media}\n"
         f"Interval: {s.get('interval_minutes')} min\n"
         f"Protection: {'ON' if s.get('protect_content') else 'OFF'}\n"
         f"Source chat: {source}"
