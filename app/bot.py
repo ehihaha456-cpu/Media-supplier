@@ -13,6 +13,13 @@ logging.basicConfig(level=logging.INFO)
 
 WAIT_TEXT, WAIT_BUTTON = range(2)
 
+# Prevent /start and the background delivery loop from claiming the same media concurrently.
+_delivery_locks = {}
+def _delivery_lock(key):
+    if key not in _delivery_locks:
+        _delivery_locks[key] = asyncio.Lock()
+    return _delivery_locks[key]
+
 
 def is_owner(uid):
     return uid in OWNER_IDS
@@ -69,14 +76,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not bool(settings.get("delivery_enabled", True)):
         return
 
-    media = await db.next_user_media(uid)
-    if media:
+    async with _delivery_lock(("user", uid)):
+        media = await db.next_user_media(uid)
+        if not media:
+            return
         try:
-            await send_media(context.bot, uid, media, settings)
+            await deliver_one(context.bot, uid, media, settings, target_kind="user")
+            await db.advance_user_media(uid, media["seq"])
             interval = max(1, int(settings.get("interval_minutes", 60)))
             await db.update_user_schedule(uid, db.now() + timedelta(minutes=interval))
         except Exception:
-            log.exception("Immediate /start media delivery failed for user %s", uid)
+            log.exception("Initial media delivery failed for user %s", uid)
 
 
 async def stop(update, context):
@@ -518,8 +528,62 @@ async def source_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 log.info("Captured document seq=%s from source %s", seq, chat.id)
 
 
-async def deliver_one(bot, target_id, media, settings):
-    await send_media(bot, target_id, media, settings)
+async def deliver_one(bot, target_id, media, settings, target_kind="user"):
+    message = await send_media(bot, target_id, media, settings)
+
+    # This limit is for messages visible in THIS recipient chat.
+    # The source media library is never trimmed.
+    limit = max(1, int(settings.get("storage_limit", 10)))
+
+    if target_kind == "user":
+        old_ids = await db.push_user_sent_message_id(
+            target_id, message.message_id, limit
+        )
+    else:
+        old_ids = await db.push_chat_sent_message_id(
+            target_id, message.message_id, limit
+        )
+
+    for old_id in old_ids:
+        try:
+            await bot.delete_message(chat_id=target_id, message_id=old_id)
+        except Exception:
+            log.warning(
+                "Could not delete old bot media message %s in chat %s",
+                old_id, target_id
+            )
+
+    return message
+
+
+async def _deliver_user(application, user, settings, at, interval):
+    uid = user["user_id"]
+    if is_owner(uid):
+        return
+    async with _delivery_lock(("user", uid)):
+        media = await db.next_user_media(uid)
+        if not media:
+            await db.update_user_schedule(uid, at + timedelta(minutes=interval))
+            return
+        try:
+            await deliver_one(application.bot, uid, media, settings, target_kind="user")
+            await db.advance_user_media(uid, media["seq"])
+        finally:
+            await db.update_user_schedule(uid, at + timedelta(minutes=interval))
+
+
+async def _deliver_chat(application, chat, settings, at, interval):
+    chat_id = chat["chat_id"]
+    async with _delivery_lock(("chat", chat_id)):
+        media = await db.next_chat_media(chat_id)
+        if not media:
+            await db.update_chat_schedule(chat_id, at + timedelta(minutes=interval))
+            return
+        try:
+            await deliver_one(application.bot, chat_id, media, settings, target_kind="chat")
+            await db.advance_chat_media(chat_id, media["seq"])
+        finally:
+            await db.update_chat_schedule(chat_id, at + timedelta(minutes=interval))
 
 
 async def delivery_loop(application):
@@ -535,37 +599,22 @@ async def delivery_loop(application):
 
             user_cursor = await db.active_users_due(at)
             async for user in user_cursor:
-                uid = user.get("user_id")
-                if not uid or is_owner(uid):
-                    continue
                 try:
-                    media = await db.next_user_media(uid)
-                    if media:
-                        await deliver_one(application.bot, uid, media, settings)
-                    await db.update_user_schedule(uid, at + timedelta(minutes=interval))
+                    await _deliver_user(application, user, settings, at, interval)
                 except Exception:
-                    log.exception("User %s delivery failed", uid)
-                    await db.update_user_schedule(uid, at + timedelta(minutes=interval))
+                    log.exception("User %s delivery failed", user.get("user_id"))
 
             chat_cursor = await db.active_chats_due(at)
             async for chat in chat_cursor:
-                chat_id = chat.get("chat_id")
-                if not chat_id:
-                    continue
                 try:
-                    media = await db.next_chat_media(chat_id)
-                    if media:
-                        await deliver_one(application.bot, chat_id, media, settings)
-                    await db.update_chat_schedule(chat_id, at + timedelta(minutes=interval))
+                    await _deliver_chat(application, chat, settings, at, interval)
                 except Exception:
-                    log.exception("Chat %s delivery failed", chat_id)
-                    await db.update_chat_schedule(chat_id, at + timedelta(minutes=interval))
+                    log.exception("Chat %s delivery failed", chat.get("chat_id"))
 
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception("Delivery loop error")
-
         await asyncio.sleep(5)
 
 
