@@ -83,8 +83,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await deliver_one(context.bot, uid, media, settings, target_kind="user")
             await db.advance_user_media(uid, media["seq"])
-            interval = max(1, int(settings.get("interval_minutes", 60)))
-            await db.update_user_schedule(uid, db.now() + timedelta(minutes=interval))
+            interval = max(1, int(settings.get("interval_seconds", settings.get("interval_minutes", 60))))
+            await db.update_user_schedule(uid, db.now() + timedelta(seconds=interval))
         except Exception:
             log.exception("Initial media delivery failed for user %s", uid)
 
@@ -218,7 +218,7 @@ async def ask_interval(update, context):
     q = update.callback_query
     await q.answer()
     context.user_data["editor_action"] = "interval"
-    await q.edit_message_text("Send the interval in minutes (example: 60). Minimum 1 minute.\n\nUse /cancel to cancel.")
+    await q.edit_message_text("Send the interval in seconds (example: 60 = 1 minute). Minimum 1 second.\n\nUse /cancel to cancel.")
     return WAIT_TEXT
 
 
@@ -260,14 +260,14 @@ async def save_text(update, context):
     elif action == "interval":
         try:
             n = int(text)
-            if not 1 <= n <= 10080:
+            if not 1 <= n <= 604800:
                 raise ValueError
         except ValueError:
-            await update.effective_message.reply_text("❌ Enter a number from 1 to 10080 minutes.")
+            await update.effective_message.reply_text("❌ Enter a number from 1 to 604800 seconds (1 second to 7 days).")
             context.user_data["editor_action"] = "interval"
             return WAIT_TEXT
-        await db.update_settings({"interval_minutes": n})
-        await update.effective_message.reply_text(f"✅ Send interval set to {n} minutes.", reply_markup=main_keyboard())
+        await db.update_settings({"interval_seconds": n})
+        await update.effective_message.reply_text(f"✅ Send interval set to {n} seconds.", reply_markup=main_keyboard())
     return ConversationHandler.END
 
 
@@ -575,13 +575,13 @@ async def _deliver_user(application, user, settings, at, interval):
     async with _delivery_lock(("user", uid)):
         media = await db.next_user_media(uid)
         if not media:
-            await db.update_user_schedule(uid, at + timedelta(minutes=interval))
+            await db.update_user_schedule(uid, at + timedelta(seconds=interval))
             return
         try:
             await deliver_one(application.bot, uid, media, settings, target_kind="user")
             await db.advance_user_media(uid, media["seq"])
         finally:
-            await db.update_user_schedule(uid, at + timedelta(minutes=interval))
+            await db.update_user_schedule(uid, at + timedelta(seconds=interval))
 
 
 async def _deliver_chat(application, chat, settings, at, interval):
@@ -589,13 +589,13 @@ async def _deliver_chat(application, chat, settings, at, interval):
     async with _delivery_lock(("chat", chat_id)):
         media = await db.next_chat_media(chat_id)
         if not media:
-            await db.update_chat_schedule(chat_id, at + timedelta(minutes=interval))
+            await db.update_chat_schedule(chat_id, at + timedelta(seconds=interval))
             return
         try:
             await deliver_one(application.bot, chat_id, media, settings, target_kind="chat")
             await db.advance_chat_media(chat_id, media["seq"])
         finally:
-            await db.update_chat_schedule(chat_id, at + timedelta(minutes=interval))
+            await db.update_chat_schedule(chat_id, at + timedelta(seconds=interval))
 
 
 async def delivery_loop(application):
@@ -607,7 +607,7 @@ async def delivery_loop(application):
                 continue
 
             at = db.now()
-            interval = max(1, int(settings.get("interval_minutes", 60)))
+            interval = max(1, int(settings.get("interval_seconds", settings.get("interval_minutes", 60))))
 
             user_cursor = await db.active_users_due(at)
             async for user in user_cursor:
