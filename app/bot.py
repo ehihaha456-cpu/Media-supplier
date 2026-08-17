@@ -66,8 +66,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if is_owner(uid):
         settings = await db.get_settings()
-        await update.effective_message.reply_text(
-            "🛠 Admin Panel\n\nOwner account is excluded from automatic media delivery.",
+        await update.effective_message.reply_text('🎬 Welcome to Media Supplier!\n\nThis bot automatically delivers media to you at the scheduled interval.\n\n📦 New media will arrive automatically.\n🔄 Media is continuously rotated.\n⚙️ Delivery is fully automated.\n\nEnjoy! ❤️',
             reply_markup=main_keyboard(settings),
         )
         return
