@@ -156,8 +156,14 @@ async def test_send(update, context):
 async def settings_page(update, context):
     q = update.callback_query
     await q.answer()
-    s = await db.get_settings()
-    await q.edit_message_text("⚙️ Settings", reply_markup=settings_keyboard(s))
+    settings = await db.get_settings()
+    kb = settings_keyboard(settings)
+    rows = list(kb.inline_keyboard)
+    rows.append([InlineKeyboardButton("🗑️ Reset Source Media", callback_data="reset_source_media")])
+    await q.edit_message_text(
+        "⚙️ Settings",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
 
 
 async def editor_page(update, context):
@@ -375,6 +381,57 @@ async def preview(update, context):
     s = await db.get_settings()
     await q.answer()
     await send_media(context.bot, q.message.chat_id, media, s)
+
+
+async def reset_source_media_confirm(update, context):
+    q = update.callback_query
+    await q.answer()
+    if not is_owner(q.from_user.id):
+        return
+    await q.edit_message_text(
+        "⚠️ Reset Source Media?\\n\\n"
+        "This will permanently remove all media stored in the bot's "
+        "source library and reset delivery positions.\\n\\n"
+        "The actual messages in the Telegram source group/channel will NOT be deleted.\\n\\n"
+        "Are you sure?",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("❌ Cancel", callback_data="settings"),
+                InlineKeyboardButton("✅ Reset Media", callback_data="reset_source_media_yes"),
+            ]
+        ]),
+    )
+
+
+async def reset_source_media_yes(update, context):
+    q = update.callback_query
+    await q.answer()
+    if not is_owner(q.from_user.id):
+        return
+
+    try:
+        # Source library collection is "media" in this project.
+        result = await db.db.media.delete_many({})
+
+        # Reset per-recipient sequence pointers. Existing recipients remain
+        # registered; only their media position is restarted.
+        await db.db.users.update_many({}, {"$set": {"next_seq": 0}})
+        await db.db.chats.update_many({}, {"$set": {"next_seq": 0}})
+
+        await q.edit_message_text(
+            f"✅ Source Media Reset Complete.\\n\\n"
+            f"🗑️ Removed from bot library: {result.deleted_count}\\n"
+            "🔄 Delivery sequence reset.\\n"
+            "📦 Source group/channel messages were not deleted.\\n\\n"
+            "Send new media to the source chat to start a fresh library.",
+            reply_markup=main_keyboard(),
+        )
+    except Exception:
+        log.exception("Source media reset failed")
+        await q.edit_message_text(
+            "❌ Could not reset source media. Check the Render logs.",
+            reply_markup=main_keyboard(),
+        )
 
 
 async def library(update, context):
@@ -770,6 +827,8 @@ def build_application():
     app.add_handler(CallbackQueryHandler(toggle_delivery, pattern="^toggle_delivery$"))
     app.add_handler(CallbackQueryHandler(test_send, pattern="^test_send$"))
     app.add_handler(CallbackQueryHandler(settings_page, pattern="^settings$"))
+    app.add_handler(CallbackQueryHandler(reset_source_media_confirm, pattern="^reset_source_media$"))
+    app.add_handler(CallbackQueryHandler(reset_source_media_yes, pattern="^reset_source_media_yes$"))
     app.add_handler(CallbackQueryHandler(editor_page, pattern="^editor$"))
     app.add_handler(CallbackQueryHandler(toggle_protect, pattern="^toggle_protect$"))
     app.add_handler(CallbackQueryHandler(clear_caption, pattern="^clear_caption$"))
