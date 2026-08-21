@@ -761,36 +761,76 @@ async def _deliver_chat(application, chat, settings, at, interval):
             await db.update_chat_schedule(chat_id, at + timedelta(seconds=interval))
 
 
+# Delivery jobs are scheduled independently per recipient.
+# This prevents a large number of users/groups from making one user's
+# 30-second interval turn into several minutes.
+_inflight_deliveries = set()
+_delivery_semaphore = asyncio.Semaphore(20)
+
+
+async def _run_user_delivery(application, user, settings, at, interval):
+    key = ("user", user["user_id"])
+    try:
+        async with _delivery_semaphore:
+            await _deliver_user(application, user, settings, at, interval)
+    except Exception:
+        log.exception("User %s delivery failed", user.get("user_id"))
+    finally:
+        _inflight_deliveries.discard(key)
+
+
+async def _run_chat_delivery(application, chat, settings, at, interval):
+    key = ("chat", chat["chat_id"])
+    try:
+        async with _delivery_semaphore:
+            await _deliver_chat(application, chat, settings, at, interval)
+    except Exception:
+        log.exception("Chat %s delivery failed", chat.get("chat_id"))
+    finally:
+        _inflight_deliveries.discard(key)
+
+
 async def delivery_loop(application):
     while True:
         try:
             settings = await db.get_settings()
             if not settings or not bool(settings.get("delivery_enabled", True)):
-                await asyncio.sleep(5)
+                await asyncio.sleep(2)
                 continue
 
             at = db.now()
-            interval = max(1, int(settings.get("interval_seconds", settings.get("interval_minutes", 60))))
+            interval = max(
+                1,
+                int(settings.get("interval_seconds", settings.get("interval_minutes", 60))),
+            )
 
+            # IMPORTANT: do not await each recipient one-by-one.
+            # Queue due recipients concurrently so each recipient keeps its
+            # own schedule instead of waiting for all previous recipients.
             user_cursor = await db.active_users_due(at)
             async for user in user_cursor:
-                try:
-                    await _deliver_user(application, user, settings, at, interval)
-                except Exception:
-                    log.exception("User %s delivery failed", user.get("user_id"))
+                key = ("user", user["user_id"])
+                if key not in _inflight_deliveries:
+                    _inflight_deliveries.add(key)
+                    asyncio.create_task(
+                        _run_user_delivery(application, user, settings, at, interval)
+                    )
 
             chat_cursor = await db.active_chats_due(at)
             async for chat in chat_cursor:
-                try:
-                    await _deliver_chat(application, chat, settings, at, interval)
-                except Exception:
-                    log.exception("Chat %s delivery failed", chat.get("chat_id"))
+                key = ("chat", chat["chat_id"])
+                if key not in _inflight_deliveries:
+                    _inflight_deliveries.add(key)
+                    asyncio.create_task(
+                        _run_chat_delivery(application, chat, settings, at, interval)
+                    )
 
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception("Delivery loop error")
-        await asyncio.sleep(5)
+
+        await asyncio.sleep(2)
 
 
 async def initialize(application):
